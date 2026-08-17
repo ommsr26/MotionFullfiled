@@ -305,8 +305,6 @@ def parse_serial_line(line):
                                 hardware_state["rtc"]["logged_online"] = True
                                 hardware_state["rtc"]["last_ts"] = ts
                                 log_hardware("RTC MODULE (DS3231)", "ONLINE & SYNCHRONIZED", f"JSON Timestamp: {ts}")
-                            elif latest_sensor["timestamp"] != ts:
-                                print(f"[RTC STREAM] {ts}")
 
                             latest_sensor["timestamp"] = ts
                             latest_sensor["rtc_error"] = None
@@ -382,8 +380,6 @@ def parse_serial_line(line):
                     hardware_state["rtc"]["logged_online"] = True
                     hardware_state["rtc"]["last_ts"] = ts
                     log_hardware("RTC MODULE (DS3231)", "ONLINE & SYNCHRONIZED", f"Hardware timestamp: {ts}")
-                elif latest_sensor["timestamp"] != ts:
-                    print(f"[RTC STREAM] {ts}")
 
                 latest_sensor["timestamp"] = ts
                 latest_sensor["rtc_error"] = None
@@ -429,8 +425,6 @@ def parse_serial_line(line):
                 hardware_state["rtc"]["logged_online"] = True
                 hardware_state["rtc"]["last_ts"] = ts
                 log_hardware("RTC MODULE (DS3231)", "ONLINE & SYNCHRONIZED", f"Parsed timestamp: {ts}")
-            elif latest_sensor["timestamp"] != ts:
-                print(f"[RTC STREAM] {ts}")
 
             latest_sensor["timestamp"] = ts
             latest_sensor["rtc_error"] = None
@@ -513,17 +507,12 @@ def serial_reader(port_arg, baud_rate, stop_event):
                 try:
                     raw_bytes = ser.readline()
                     if not raw_bytes:
-                        idle_count += 1
-                        if idle_count >= 10:
-                            idle_count = 0
-                            print(f"[SERIAL] Port {target_port} open @ {baud_rate} baud, awaiting incoming sensor lines...")
                         continue
 
                     idle_count = 0
                     line = raw_bytes.decode("utf-8", errors="ignore").strip()
                     if line:
                         latest_sensor["last_raw_line"] = line
-                        print(f"[SERIAL RAW] {line}")
                         parse_serial_line(line)
 
                 except serial.SerialException as e:
