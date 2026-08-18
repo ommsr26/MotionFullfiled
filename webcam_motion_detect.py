@@ -37,7 +37,7 @@ DEFAULT_SERIAL_PORT = "COM3"    # Windows e.g. "COM3" or "AUTO" | Linux e.g. "/d
 DEFAULT_BAUD_RATE = 115200      # 115200 baud for high-speed Arduino/ESP32 streaming
 
 # ---- Default backend configuration ----
-DEFAULT_BACKEND_URL = os.environ.get("SWSTP_BACKEND_URL", "http://localhost:5000")
+DEFAULT_BACKEND_URL = os.environ.get("SWSTP_BACKEND_URL", "https://solidwasteapi.scipl.info.in")
 DEFAULT_DEVICE_ID = "SWSTP-EDGE-01"
 DEFAULT_ULB_ID = "ULB_MH_AMRAVATI"
 DEFAULT_VEHICLE_ID = "MH-27-BE-1088"
@@ -1139,7 +1139,7 @@ def main():
     parser.add_argument("--source", "-s", default=None, help="Video source (0 for default webcam, or path to MP4)")
     parser.add_argument("--port", "-p", default=DEFAULT_SERIAL_PORT, help="Serial COM port (e.g. COM3, AUTO)")
     parser.add_argument("--baud", "-b", type=int, default=DEFAULT_BAUD_RATE, help="Baud rate (default: 115200)")
-    parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL, help="SWSTP Backend URL (default: http://localhost:5000)")
+    parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL, help="SWSTP Backend URL (default: https://solidwasteapi.scipl.info.in)")
     parser.add_argument("--device-id", default=DEFAULT_DEVICE_ID, help="Hardware Device Code (default: SWSTP-EDGE-01)")
     parser.add_argument("--ulb-id", default=DEFAULT_ULB_ID, help="ULB ID (default: ULB_MH_AMRAVATI)")
     parser.add_argument("--session-id", type=int, default=0, help="Operational Session ID (0 for automatic active session detection)")
