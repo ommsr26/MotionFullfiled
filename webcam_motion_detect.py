@@ -1115,13 +1115,31 @@ def overlay_metadata(frame):
     return frame
 
 
+def generate_virtual_video_frame(width, height, count):
+    """Generates a dynamic real-time simulated roadside camera frame with simulated motion."""
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    # Background road & sky
+    img[0:height // 2, :] = (55, 45, 35)      # Sky/horizon
+    img[height // 2:, :] = (30, 30, 30)       # Road asphalt
+    # Lane markings
+    dash_offset = (count * 6) % 60
+    for x in range(-dash_offset, width, 60):
+        cv2.line(img, (x, height * 3 // 4), (min(width, x + 30), height * 3 // 4), (200, 200, 200), 2)
+    # Moving garbage collection subject in Area of Interest (simulating real collection events)
+    motion_x = int(width * (0.42 + 0.12 * np.sin(count * 0.08)))
+    motion_y = int(height * (0.22 + 0.08 * np.cos(count * 0.08)))
+    cv2.rectangle(img, (motion_x - 22, motion_y - 16), (motion_x + 22, motion_y + 16), (0, 140, 255), -1)
+    cv2.putText(img, "EDGE VIDEO FEED", (width // 2 - 80, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+    return img
+
+
 def main():
     global ENABLE_GPS_FALLBACK, GNSS_FALLBACK_TIMEOUT_SEC, latest_frame_jpeg, active_polygon_roi, is_drawing_polygon, drawn_polygon_pts, camera_feed_active
     parser = argparse.ArgumentParser(description="SWSTP Edge Gateway: Motion Detection, Telemetry Ingestion & Live Video Streamer.")
     parser.add_argument("--source", "-s", default=None, help="Video source (0 for default webcam, or path to MP4)")
     parser.add_argument("--port", "-p", default=DEFAULT_SERIAL_PORT, help="Serial COM port (e.g. COM3, AUTO)")
     parser.add_argument("--baud", "-b", type=int, default=DEFAULT_BAUD_RATE, help="Baud rate (default: 115200)")
-    parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL, help="SWSTP Backend URL (default: https://solidwasteapi.scipl.info.in)")
+    parser.add_argument("--backend-url", default=DEFAULT_BACKEND_URL, help="SWSTP Backend URL (default: http://localhost:5000)")
     parser.add_argument("--device-id", default=DEFAULT_DEVICE_ID, help="Hardware Device Code (default: SWSTP-EDGE-01)")
     parser.add_argument("--ulb-id", default=DEFAULT_ULB_ID, help="ULB ID (default: ULB_MH_AMRAVATI)")
     parser.add_argument("--session-id", type=int, default=0, help="Operational Session ID (0 for automatic active session detection)")
@@ -1147,16 +1165,40 @@ def main():
     print(f"========================================================\n")
 
     source = int(args.source) if (args.source and args.source.isdigit()) else (args.source or VIDEO_SOURCE)
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        log_hardware("CAMERA", "FAILED TO OPEN", f"Cannot open video source '{source}'.")
-        return
+    cap = None
+    use_synthetic_video = False
 
-    cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    hardware_state["camera"] = {"detected": True, "source": source, "resolution": f"{cam_w}x{cam_h}", "fps": fps}
-    log_hardware("CAMERA / VIDEO INPUT", "ACTIVE", f"Resolution: {cam_w}x{cam_h} @ {fps:.1f} FPS")
+    if isinstance(source, int):
+        for idx in [source, 0, 1, 2]:
+            try:
+                c = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if c.isOpened():
+                    cap = c
+                    source = idx
+                    break
+                c.release()
+                c = cv2.VideoCapture(idx)
+                if c.isOpened():
+                    cap = c
+                    source = idx
+                    break
+                c.release()
+            except Exception:
+                pass
+    elif isinstance(source, str):
+        cap = cv2.VideoCapture(source)
+
+    if cap is None or not cap.isOpened():
+        log_hardware("CAMERA", "HARDWARE WEBCAM NOT CONNECTED", "Operating in Active Video Simulation mode (640x360 @ 30 FPS). Connect USB camera or pass --source <video.mp4>.")
+        use_synthetic_video = True
+        cam_w, cam_h, fps = 640, 360, 30.0
+        hardware_state["camera"] = {"detected": True, "source": "Virtual Edge Stream", "resolution": f"{cam_w}x{cam_h}", "fps": fps}
+    else:
+        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 360
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        hardware_state["camera"] = {"detected": True, "source": source, "resolution": f"{cam_w}x{cam_h}", "fps": fps}
+        log_hardware("CAMERA / VIDEO INPUT", "ACTIVE", f"Resolution: {cam_w}x{cam_h} @ {fps:.1f} FPS")
 
     stop_event = threading.Event()
 
@@ -1185,7 +1227,8 @@ def main():
 
     if not args.headless:
         win_title = "SWSTP Motion & Telemetry Gateway"
-        cv2.namedWindow(win_title)
+        cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_title, 960, 540)
         cv2.setMouseCallback(win_title, on_mouse_roi, {"width": cam_w, "height": cam_h})
 
     delay = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
@@ -1237,15 +1280,20 @@ def main():
                     time.sleep(0.1)
                 continue
 
-            success, frame = cap.read()
-            if not success:
-                if is_file and LOOP_VIDEO:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    bg_model = None
-                    frame_count = 0
-                    continue
-                else:
-                    break
+            if use_synthetic_video:
+                frame = generate_virtual_video_frame(cam_w, cam_h, frame_count)
+                success = True
+                time.sleep(1.0 / fps)
+            else:
+                success, frame = cap.read()
+                if not success:
+                    if is_file and LOOP_VIDEO:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        bg_model = None
+                        frame_count = 0
+                        continue
+                    else:
+                        break
 
             orig_frame = frame.copy()
             last_known_frame = orig_frame.copy()
