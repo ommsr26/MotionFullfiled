@@ -36,11 +36,11 @@ DEFAULT_SERIAL_PORT = "COM3"    # Windows e.g. "COM3" or "AUTO" | Linux e.g. "/d
 DEFAULT_BAUD_RATE = 115200      # 115200 baud for high-speed Arduino/ESP32 streaming
 
 # ---- Default backend configuration ----
-DEFAULT_BACKEND_URL = "http://localhost:5000"
+DEFAULT_BACKEND_URL = "https://solidwasteapi.scipl.info.in"
 DEFAULT_DEVICE_ID = "SWSTP-EDGE-01"
 DEFAULT_ULB_ID = "ULB_MH_AMRAVATI"
 DEFAULT_VEHICLE_ID = "MH-27-BE-1088"
-DEFAULT_STREAM_FPS = 2.0        # FPS to push live frames to /api/camera/{deviceId}/frame
+DEFAULT_STREAM_FPS = 30.0       # 25-30+ FPS smooth live video stream to /api/camera/{deviceId}/frame
 
 # Shared sensor telemetry state
 latest_sensor = {
@@ -72,6 +72,7 @@ hardware_state = {
 
 # Thread-safe queues
 upload_queue = queue.Queue(maxsize=50)
+telemetry_queue = queue.Queue(maxsize=3000) # Strict FIFO sequential telemetry queue
 latest_frame_lock = threading.Lock()
 latest_frame_jpeg = None
 
@@ -308,8 +309,6 @@ def parse_serial_line(line):
                     latest_sensor["imu"] = telemetry["imu"]
                     parsed_something = True
 
-                if parsed_something:
-                    return True
         except json.JSONDecodeError:
             pass
 
@@ -338,6 +337,45 @@ def parse_serial_line(line):
                         parsed_something = True
                 except (ValueError, IndexError):
                     pass
+
+    # Sequential queueing for smooth, monotonic telemetry delivery
+    if parsed_something:
+        now_epoch_ms = int(time.time() * 1000)
+        iso_time = latest_sensor["timestamp"] or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        pkt = {
+            "sequence": latest_sensor["sequence"],
+            "timestamp": now_epoch_ms,
+            "uptime_ms": now_epoch_ms,
+            "rawJson": line,
+            "rtc": {
+                "iso": iso_time,
+                "epoch": now_epoch_ms,
+                "synced": latest_sensor["timestamp"] is not None
+            },
+            "gnss": {
+                "lat": latest_sensor["lat"] if latest_sensor["gps_valid"] else None,
+                "lon": latest_sensor["lon"] if latest_sensor["gps_valid"] else None,
+                "alt": latest_sensor["alt"],
+                "speed": latest_sensor["speed"],
+                "heading": latest_sensor["heading"],
+                "satellites": latest_sensor["satellites"],
+                "fix": "3D_FIX" if latest_sensor["gps_valid"] else "NO_FIX",
+                "valid": latest_sensor["gps_valid"]
+            },
+            "imu": latest_sensor.get("imu") or {
+                "accel": {"x": 0.0, "y": 0.0, "z": 1.0},
+                "gyro": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "valid": True
+            }
+        }
+        try:
+            telemetry_queue.put_nowait(pkt)
+        except queue.Full:
+            try:
+                telemetry_queue.get_nowait()
+                telemetry_queue.put_nowait(pkt)
+            except Exception:
+                pass
 
     return parsed_something
 
@@ -410,10 +448,15 @@ def serial_reader(port_arg, baud_rate, stop_event):
 
 # ─── Live Camera Frame Streamer Thread (POST /api/camera/{deviceId}/frame) ───
 def live_frame_streamer(backend_url, device_id, fps, stop_event):
-    """Periodically pushes current JPEG frames to the Backend Camera endpoint."""
+    """Pushes live JPEG frames to Backend at high framerate (up to 30+ FPS) using Keep-Alive."""
     global latest_frame_jpeg, hardware_state
     url = f"{backend_url.rstrip('/')}/api/camera/{device_id}/frame"
     interval = 1.0 / max(0.2, fps)
+
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
     while not stop_event.is_set():
         frame_bytes = None
@@ -423,11 +466,11 @@ def live_frame_streamer(backend_url, device_id, fps, stop_event):
 
         if frame_bytes:
             try:
-                resp = requests.post(
+                resp = session.post(
                     url,
                     data=frame_bytes,
-                    headers={"Content-Type": "image/jpeg"},
-                    timeout=2.0
+                    headers={"Content-Type": "image/jpeg", "Connection": "keep-alive"},
+                    timeout=1.0
                 )
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"] = True
@@ -437,23 +480,37 @@ def live_frame_streamer(backend_url, device_id, fps, stop_event):
 
         stop_event.wait(interval)
 
+    session.close()
+
 
 # ─── Telemetry Batch Ingestion Worker (POST /api/telemetry/ingest-batch) ──────
 def telemetry_streamer(backend_url, session_id, stop_event):
-    """Sends 1 Hz telemetry batches to the backend for live maps and 3D IMU."""
+    """Sends sequential telemetry batches to backend with HTTP keep-alive connection pooling."""
     global latest_sensor, hardware_state
     url = f"{backend_url.rstrip('/')}/api/telemetry/ingest-batch"
 
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
     while not stop_event.is_set():
-        if latest_sensor["timestamp"] or latest_sensor["gps_valid"] or latest_sensor["imu"]:
+        packets = []
+        while not telemetry_queue.empty() and len(packets) < 50:
+            try:
+                packets.append(telemetry_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        if not packets and (latest_sensor["timestamp"] or latest_sensor["gps_valid"] or latest_sensor["imu"]):
+            # Heartbeat packet when idle
             now_epoch_ms = int(time.time() * 1000)
             iso_time = latest_sensor["timestamp"] or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-            packet = {
+            packets.append({
                 "sequence": latest_sensor["sequence"],
                 "timestamp": now_epoch_ms,
                 "uptime_ms": now_epoch_ms,
-                "rawJson": latest_sensor.get("last_raw_line") or "",
+                "rawJson": latest_sensor.get("last_raw_line") or "{}",
                 "rtc": {
                     "iso": iso_time,
                     "epoch": now_epoch_ms,
@@ -474,23 +531,26 @@ def telemetry_streamer(backend_url, session_id, stop_event):
                     "gyro": {"x": 0.0, "y": 0.0, "z": 0.0},
                     "valid": True
                 }
-            }
+            })
 
+        if packets:
             batch = {
                 "sessionId": session_id or 0,
                 "mode": "REAL_HARDWARE",
-                "packets": [packet]
+                "packets": packets
             }
 
             try:
-                resp = requests.post(url, json=batch, timeout=2.0)
+                resp = session.post(url, json=batch, timeout=2.0)
                 if resp.status_code == 200:
                     hardware_state["backend"]["connected"] = True
-                    hardware_state["backend"]["telemetry_count"] += 1
+                    hardware_state["backend"]["telemetry_count"] += len(packets)
             except Exception:
                 hardware_state["backend"]["connected"] = False
 
-        stop_event.wait(1.0)
+        stop_event.wait(0.1) # 10 Hz batch flush for ultra-smooth sequential streaming
+
+    session.close()
 
 
 # ─── Evidence Upload Worker (POST /api/evidence/upload) ───────────────────────
@@ -539,11 +599,32 @@ def evidence_upload_worker(backend_url, stop_event):
             upload_queue.task_done()
 
 
+def cleanup_old_local_captures(save_dir="captures", retention_days=3):
+    """Deletes local capture frames older than retention_days (3 days default)."""
+    if not os.path.exists(save_dir):
+        return
+    now = time.time()
+    cutoff = now - (retention_days * 86400)
+    for fname in os.listdir(save_dir):
+        fpath = os.path.join(save_dir, fname)
+        if os.path.isfile(fpath):
+            try:
+                if os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+            except Exception:
+                pass
+
+
 # ---- Motion detection parameters ----
 VIDEO_SOURCE = 0
 LOOP_VIDEO = True
 FRAME_SIZE = (320, 180)
-ROI = (231, 17, 86, 43)
+ROI_CONFIG_FILE = "roi_polygon.json"
+DEFAULT_ROI_POLYGON = [[0.35, 0.10], [0.65, 0.10], [0.65, 0.50], [0.35, 0.50]] # Normalized [x, y]
+active_polygon_roi = DEFAULT_ROI_POLYGON.copy()
+is_drawing_polygon = False
+drawn_polygon_pts = []
+
 DIFF_THRESHOLD = 15
 MIN_CONTOUR_AREA = 150
 BG_ALPHA = 0.03
@@ -551,11 +632,84 @@ WARMUP_FRAMES = 30
 SAVE_COOLDOWN_SEC = 1.0
 
 
-def apply_roi_mask(thresh, roi):
-    x, y, w, h = roi
-    mask = np.zeros_like(thresh)
-    mask[y:y + h, x:x + w] = 255
+def load_roi_polygon(config_file=ROI_CONFIG_FILE):
+    """Loads saved polygon ROI vertices from JSON config file if available."""
+    global active_polygon_roi
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) >= 3:
+                    active_polygon_roi = data
+                    print(f"[ROI] Loaded polygon ROI with {len(data)} vertices from {config_file}")
+                    return active_polygon_roi
+        except Exception as e:
+            print(f"[ROI] Warning loading {config_file}: {e}")
+    active_polygon_roi = DEFAULT_ROI_POLYGON.copy()
+    return active_polygon_roi
+
+
+def save_roi_polygon(pts, config_file=ROI_CONFIG_FILE):
+    """Saves polygon ROI vertices to JSON config file."""
+    try:
+        with open(config_file, "w") as f:
+            json.dump(pts, f, indent=2)
+        print(f"[ROI] Saved polygon ROI with {len(pts)} vertices to {config_file}")
+    except Exception as e:
+        print(f"[ROI] Warning saving {config_file}: {e}")
+
+
+def apply_polygon_roi_mask(thresh, polygon_pts, frame_w, frame_h):
+    """Creates a binary mask from polygon vertices and applies bitwise AND to threshold."""
+    if not polygon_pts or len(polygon_pts) < 3:
+        return thresh
+
+    pts = []
+    for p in polygon_pts:
+        # Support normalized (0.0 - 1.0) and pixel coordinates
+        px = int(p[0] * frame_w) if p[0] <= 1.0 else int(p[0])
+        py = int(p[1] * frame_h) if p[1] <= 1.0 else int(p[1])
+        pts.append([px, py])
+
+    pts_array = np.array(pts, dtype=np.int32)
+    mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
+    cv2.fillPoly(mask, [pts_array], 255)
     return cv2.bitwise_and(thresh, mask)
+
+
+def on_mouse_roi(event, x, y, flags, param):
+    """Interactive mouse callback to draw Polygon ROI in OpenCV GUI window."""
+    global drawn_polygon_pts, active_polygon_roi, is_drawing_polygon
+    frame_w, frame_h = param.get("width", 640), param.get("height", 360)
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        norm_x = round(float(x) / frame_w, 4)
+        norm_y = round(float(y) / frame_h, 4)
+
+        # If >= 3 points and clicking near P1, auto-complete & save
+        if len(drawn_polygon_pts) >= 3:
+            p1_x, p1_y = drawn_polygon_pts[0]
+            dist = np.hypot(norm_x - p1_x, norm_y - p1_y)
+            if dist < 0.05:
+                active_polygon_roi = drawn_polygon_pts.copy()
+                save_roi_polygon(active_polygon_roi)
+                is_drawing_polygon = False
+                drawn_polygon_pts = []
+                print(f"[ROI DRAW] Auto-snapped to P1 & saved polygon with {len(active_polygon_roi)} vertices.")
+                return
+
+        drawn_polygon_pts.append([norm_x, norm_y])
+        print(f"[ROI DRAW] Added vertex #{len(drawn_polygon_pts)}: ({x}, {y}) -> [{norm_x}, {norm_y}]")
+
+    elif event == cv2.EVENT_RBUTTONDOWN:
+        if len(drawn_polygon_pts) >= 3:
+            active_polygon_roi = drawn_polygon_pts.copy()
+            save_roi_polygon(active_polygon_roi)
+            is_drawing_polygon = False
+            drawn_polygon_pts = []
+            print(f"[ROI DRAW] Polygon completed & saved with {len(active_polygon_roi)} vertices.")
+        else:
+            print("[ROI DRAW] Need at least 3 vertices to complete polygon.")
 
 
 def get_rtc_timestamp():
@@ -634,7 +788,7 @@ def main():
     parser.add_argument("--device-id", default=DEFAULT_DEVICE_ID, help="Hardware Device Code (default: SWSTP-EDGE-01)")
     parser.add_argument("--session-id", type=int, default=0, help="Operational Session ID (0 if standalone)")
     parser.add_argument("--fps-stream", type=float, default=DEFAULT_STREAM_FPS, help="Live frame streaming FPS to backend")
-    parser.add_argument("--save-dir", default="./motion_captures", help="Local directory to save captures")
+    parser.add_argument("--save-dir", default="./evidence", help="Local directory to save captures")
     parser.add_argument("--headless", action="store_true", help="Run without cv2.imshow GUI window")
     args, _ = parser.parse_known_args()
 
@@ -677,6 +831,13 @@ def main():
     t_evidence = threading.Thread(target=evidence_upload_worker, args=(args.backend_url, stop_event), daemon=True)
     t_evidence.start()
 
+    load_roi_polygon()
+
+    if not args.headless:
+        win_title = "SWSTP Motion & Telemetry Gateway"
+        cv2.namedWindow(win_title)
+        cv2.setMouseCallback(win_title, on_mouse_roi, {"width": cam_w, "height": cam_h})
+
     delay = max(1, int(1000 / (fps if (fps and 0 < fps < 120) else 30)))
     is_file = isinstance(source, str)
 
@@ -685,7 +846,7 @@ def main():
     last_save_time = 0.0
     saved_count = 0
 
-    print("[INIT] Edge Gateway running. Press 'q' to stop.\n")
+    print("[INIT] Edge Gateway running. Press 'q' to stop | 'p' to draw polygon ROI.\n")
 
     try:
         while not stop_event.is_set():
@@ -742,7 +903,9 @@ def main():
             bg_uint8 = cv2.convertScaleAbs(bg_model)
             diff = cv2.absdiff(bg_uint8, gray_blur)
             _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
-            thresh = apply_roi_mask(thresh, ROI)
+            
+            # Apply Polygon ROI Mask on processing resolution (320, 180)
+            thresh = apply_polygon_roi_mask(thresh, active_polygon_roi, FRAME_SIZE[0], FRAME_SIZE[1])
             dilated = cv2.dilate(thresh, None, iterations=2)
 
             cnts = cv2.findContours(dilated.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -760,10 +923,42 @@ def main():
                 orig_bw, orig_bh = int(w * scale_x), int(h * scale_y)
                 cv2.rectangle(orig_frame, (orig_x, orig_y), (orig_x + orig_bw, orig_y + orig_bh), (0, 255, 0), box_thickness)
 
-            # Draw ROI outline
-            roi_x, roi_y = int(ROI[0] * scale_x), int(ROI[1] * scale_y)
-            roi_w, roi_h = int(ROI[2] * scale_x), int(ROI[3] * scale_y)
-            cv2.rectangle(orig_frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (0, 0, 200), 1)
+            # Draw Polygon ROI on original frame
+            disp_pts = []
+            for p in active_polygon_roi:
+                px = int(p[0] * orig_w) if p[0] <= 1.0 else int(p[0])
+                py = int(p[1] * orig_h) if p[1] <= 1.0 else int(p[1])
+                disp_pts.append([px, py])
+
+            if len(disp_pts) >= 3:
+                poly_color = (0, 0, 255) if motion_detected else (255, 217, 0)
+                cv2.polylines(orig_frame, [np.array(disp_pts, dtype=np.int32)], isClosed=True, color=poly_color, thickness=2)
+                for pt in disp_pts:
+                    cv2.circle(orig_frame, tuple(pt), 4, (0, 255, 255), -1)
+                
+                # Label first vertex
+                cv2.putText(orig_frame, "POLYGON ROI (Press 'p' to edit)", (disp_pts[0][0] + 5, max(20, disp_pts[0][1] - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, poly_color, 1, cv2.LINE_AA)
+
+            # Draw in-progress polygon if drawing mode active
+            if is_drawing_polygon and len(drawn_polygon_pts) > 0:
+                prog_pts = []
+                for p in drawn_polygon_pts:
+                    prog_pts.append([int(p[0] * orig_w), int(p[1] * orig_h)])
+                for idx, pt in enumerate(prog_pts):
+                    pt_color = (0, 255, 0) if (idx == 0 and len(prog_pts) >= 3) else (0, 0, 255)
+                    cv2.circle(orig_frame, tuple(pt), 6, pt_color, -1)
+                    cv2.putText(orig_frame, f"P{idx+1}", (pt[0] + 6, pt[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                if len(prog_pts) >= 2:
+                    is_closed = len(prog_pts) >= 3
+                    cv2.polylines(orig_frame, [np.array(prog_pts, dtype=np.int32)], isClosed=is_closed, color=(0, 255, 255) if is_closed else (0, 0, 255), thickness=2)
+                    if is_closed:
+                        # Draw snap ring around P1
+                        cv2.circle(orig_frame, tuple(prog_pts[0]), 12, (0, 255, 0), 2)
+                        cv2.putText(orig_frame, "Click P1 to Auto-Close", (prog_pts[0][0] + 16, prog_pts[0][1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+
+                cv2.putText(orig_frame, "DRAWING ROI: Click on video to add dots (Auto-connects on >= 3 dots)", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
             display_frame = overlay_metadata(orig_frame.copy())
 
@@ -803,11 +998,27 @@ def main():
                     })
 
                     print(f"[CAPTURE #{saved_count}] Saved: {local_path} | Queued for backend upload.")
+                    cleanup_old_local_captures(args.save_dir, retention_days=3)
 
             if not args.headless:
                 cv2.imshow("SWSTP Motion & Telemetry Gateway", display_frame)
-                if cv2.waitKey(delay) & 0xFF == ord('q'):
+                k = cv2.waitKey(delay) & 0xFF
+                if k == ord('q'):
                     break
+                elif k == ord('p'):
+                    is_drawing_polygon = not is_drawing_polygon
+                    if is_drawing_polygon:
+                        drawn_polygon_pts = []
+                        print("\n[ROI] Polygon drawing mode ACTIVE: Left-click on window to add vertices, Right-click to finish & save.\n")
+                    else:
+                        print("[ROI] Polygon drawing mode CANCELLED.")
+                elif k == ord('c'):
+                    drawn_polygon_pts = []
+                    print("[ROI] Cleared temporary drawing points.")
+                elif k == ord('r'):
+                    active_polygon_roi = DEFAULT_ROI_POLYGON.copy()
+                    save_roi_polygon(active_polygon_roi)
+                    print("[ROI] Reset polygon ROI to default.")
 
     finally:
         stop_event.set()
