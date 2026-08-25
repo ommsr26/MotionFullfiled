@@ -13,8 +13,8 @@ $watcher.Dispose()
 if ($pos -and !$pos.IsUnknown) {
     [PSCustomObject]@{
         success = $true
-        latitude = [math]::Round($pos.Latitude, 6)
-        longitude = [math]::Round($pos.Longitude, 6)
+        latitude = [math]::Round($pos.Latitude, 8)
+        longitude = [math]::Round($pos.Longitude, 8)
         altitude = $pos.Altitude
         accuracy = $pos.HorizontalAccuracy
         source = "WindowsLocationService"

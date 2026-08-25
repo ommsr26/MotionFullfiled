@@ -394,17 +394,17 @@ def snap_coordinates_to_road(lat, lon):
 
             if dist < min_dist:
                 min_dist = dist
-                best_lat = ref_lat + proj_y / lat_scale
-                best_lon = ref_lon + proj_x / lon_scale
+                best_lat = round(ref_lat + proj_y / lat_scale, 8)
+                best_lon = round(ref_lon + proj_x / lon_scale, 8)
                 seg_bearing = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
                 best_road_bearing = seg_bearing
 
     # If within 80m corridor of the road, snap permanently to centerline
     if min_dist <= 80.0:
-        is_snapped = (abs(best_lat - lat) > 1e-7 or abs(best_lon - lon) > 1e-7)
+        is_snapped = (abs(best_lat - lat) > 1e-8 or abs(best_lon - lon) > 1e-8)
         return best_lat, best_lon, False, is_snapped, best_road_bearing
 
-    return lat, lon, False, False, None
+    return round(lat, 8), round(lon, 8), False, False, None
 
 def track_field_events(lat, lon, speed, heading):
     if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
@@ -942,13 +942,17 @@ def telemetry_streamer(backend_url, session_id_arg, ulb_id, stop_event):
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
-    current_session_id = session_id_arg or 0
+    current_session_id = session_id_arg or dynamic_session_info.get("sessionId") or 0
     last_session_check = 0.0
 
     while not stop_event.is_set():
         # Auto-discover active session from backend if not explicitly provided
         now_time = time.time()
-        if not session_id_arg and (now_time - last_session_check) > 3.0:
+        active_dyn_sid = dynamic_session_info.get("sessionId") or latest_sensor.get("active_session_id") or 0
+        if active_dyn_sid > 0:
+            current_session_id = active_dyn_sid
+
+        if not session_id_arg and not active_dyn_sid and (now_time - last_session_check) > 3.0:
             last_session_check = now_time
             try:
                 s_resp = session.get(active_session_query_url, timeout=2.0)
@@ -957,16 +961,11 @@ def telemetry_streamer(backend_url, session_id_arg, ulb_id, stop_event):
                     if sessions_list and isinstance(sessions_list, list) and len(sessions_list) > 0:
                         first_active = sessions_list[0]
                         sid = first_active.get("operationalSessionId") or first_active.get("sessionId") or 0
-                        if sid != current_session_id:
+                        if sid != current_session_id and sid > 0:
                             current_session_id = sid
                             latest_sensor["active_session_id"] = sid
                             hardware_state["backend"]["active_session_id"] = sid
                             print(f"[EDGE SESSION] Automatically locked to active operational session #{sid}")
-                    else:
-                        if current_session_id != 0:
-                            current_session_id = 0
-                            latest_sensor["active_session_id"] = 0
-                            hardware_state["backend"]["active_session_id"] = 0
             except Exception:
                 pass
 
@@ -982,6 +981,11 @@ def telemetry_streamer(backend_url, session_id_arg, ulb_id, stop_event):
             latest_sensor["sequence"] += 1
             now_epoch_ms = int(time.time() * 1000)
             iso_time = latest_sensor["timestamp"] or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            raw_lat_val = latest_sensor.get("raw_gps_lat") or latest_sensor.get("lat")
+            raw_lon_val = latest_sensor.get("raw_gps_lon") or latest_sensor.get("lon")
+            disp_lat_val = latest_sensor.get("lat")
+            disp_lon_val = latest_sensor.get("lon")
+
             packets.append({
                 "sequence": latest_sensor["sequence"],
                 "timestamp": now_epoch_ms,
@@ -993,12 +997,12 @@ def telemetry_streamer(backend_url, session_id_arg, ulb_id, stop_event):
                     "synced": latest_sensor["timestamp"] is not None
                 },
                 "gnss": {
-                    "lat": latest_sensor["lat"] if latest_sensor["gps_valid"] else None,
-                    "lon": latest_sensor["lon"] if latest_sensor["gps_valid"] else None,
-                    "rawLat": latest_sensor.get("raw_gps_lat") if latest_sensor["gps_valid"] else None,
-                    "rawLon": latest_sensor.get("raw_gps_lon") if latest_sensor["gps_valid"] else None,
-                    "displayLat": latest_sensor["lat"] if latest_sensor["gps_valid"] else None,
-                    "displayLon": latest_sensor["lon"] if latest_sensor["gps_valid"] else None,
+                    "lat": round(float(disp_lat_val), 8) if (latest_sensor["gps_valid"] and disp_lat_val is not None) else None,
+                    "lon": round(float(disp_lon_val), 8) if (latest_sensor["gps_valid"] and disp_lon_val is not None) else None,
+                    "rawLat": round(float(raw_lat_val), 8) if (latest_sensor["gps_valid"] and raw_lat_val is not None) else None,
+                    "rawLon": round(float(raw_lon_val), 8) if (latest_sensor["gps_valid"] and raw_lon_val is not None) else None,
+                    "displayLat": round(float(disp_lat_val), 8) if (latest_sensor["gps_valid"] and disp_lat_val is not None) else None,
+                    "displayLon": round(float(disp_lon_val), 8) if (latest_sensor["gps_valid"] and disp_lon_val is not None) else None,
                     "isInsideSafeZone": latest_sensor.get("is_inside_safe_zone", False),
                     "isSnapped": latest_sensor.get("is_snapped", False),
                     "alt": latest_sensor["alt"],
@@ -1080,8 +1084,8 @@ def evidence_upload_worker(backend_url, device_id, ulb_id, stop_event):
                 "height": height,
                 "compressionQuality": compression_quality,
                 "idempotencyKey": idempotency_key,
-                "latitude": lat,
-                "longitude": lon,
+                "latitude": round(float(lat), 8) if lat is not None else 0.0,
+                "longitude": round(float(lon), 8) if lon is not None else 0.0,
                 "speedKph": speed,
                 "motionConfidence": 0.95,
                 "sessionId": active_sid,
@@ -1118,13 +1122,13 @@ def evidence_upload_worker(backend_url, device_id, ulb_id, stop_event):
                 print(f"            EvidenceImageId: #{img_id}")
                 print(f"            Server Path:     {res_json.get('relativePath', 'N/A')}")
                 if is_in_safe_zone(raw_lat_val, raw_lon_val):
-                    print(f"            GPS Coordinates: ({lat:.6f}, {lon:.6f}) [🛡 SAFE ZONE - NO SNAP]")
-                elif abs(raw_lat_val - lat) > 0.000001 or abs(raw_lon_val - lon) > 0.000001:
+                    print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f}) [🛡 SAFE ZONE - NO SNAP]")
+                elif abs(raw_lat_val - lat) > 0.00000001 or abs(raw_lon_val - lon) > 0.00000001:
                     drift_val = haversine_dist_meters(raw_lat_val, raw_lon_val, lat, lon)
-                    print(f"            Real Raw GPS:    ({raw_lat_val:.6f}, {raw_lon_val:.6f})")
-                    print(f"            Road Snapped GPS:({lat:.6f}, {lon:.6f}) [Correction: {drift_val:.1f}m]")
+                    print(f"            Real Raw GPS:    ({raw_lat_val:.8f}, {raw_lon_val:.8f})")
+                    print(f"            Road Snapped GPS:({lat:.8f}, {lon:.8f}) [Correction: {drift_val:.1f}m]")
                 else:
-                    print(f"            GPS Coordinates: ({lat:.6f}, {lon:.6f})")
+                    print(f"            GPS Coordinates: ({lat:.8f}, {lon:.8f})")
                 print(f"            Associated House:{house_tag}")
                 print(f"            Access URL:      {img_url}")
                 print(f"            Session ID:      #{active_sid}")
@@ -1158,8 +1162,8 @@ $watcher.Dispose()
 if ($pos -and !$pos.IsUnknown) {
     [PSCustomObject]@{
         success = $true
-        latitude = [math]::Round($pos.Latitude, 6)
-        longitude = [math]::Round($pos.Longitude, 6)
+        latitude = [math]::Round($pos.Latitude, 8)
+        longitude = [math]::Round($pos.Longitude, 8)
         altitude = $pos.Altitude
         accuracy = $pos.HorizontalAccuracy
         source = "WindowsLocationService"
