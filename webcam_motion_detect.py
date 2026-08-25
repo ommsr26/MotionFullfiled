@@ -17,6 +17,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -33,15 +34,15 @@ import serial
 import serial.tools.list_ports
 
 # ---- Default serial configuration ----
-DEFAULT_SERIAL_PORT = "COM3"    # Windows e.g. "COM3" or "AUTO" | Linux e.g. "/dev/ttyUSB0"
+DEFAULT_SERIAL_PORT = "AUTO"    # Auto-detects USB COM port for Arduino/ESP32, or specify e.g. "COM3"
 DEFAULT_BAUD_RATE = 115200      # 115200 baud for high-speed Arduino/ESP32 streaming
 
-# ---- Default backend configuration ----
+# ---- Dynamic backend discovery & configuration ----
 DEFAULT_BACKEND_URL = os.environ.get("SWSTP_BACKEND_URL", "https://solidwasteapi.scipl.info.in")
-DEFAULT_DEVICE_ID = "SWSTP-EDGE-01"
+DEFAULT_DEVICE_ID = "UNASSIGNED"
 DEFAULT_ULB_ID = "ULB_MH_AMRAVATI"
-DEFAULT_VEHICLE_ID = "MH-27-BE-1088"
-DEFAULT_STREAM_FPS = 30.0       # 25-30+ FPS smooth live video stream to /api/camera/{deviceId}/frame
+DEFAULT_VEHICLE_ID = "UNASSIGNED"
+DEFAULT_STREAM_FPS = 30.0
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 
@@ -56,13 +57,19 @@ latest_sensor = {
     "timestamp": None,
     "lat": None,
     "lon": None,
+    "raw_gps_lat": None,
+    "raw_gps_lon": None,
     "alt": 0.0,
     "speed": 0.0,
-    "heading": 0.0,
+    "heading": None,
     "satellites": 0,
     "gps_valid": False,
-    "location_source": None,   # "gnss" | "fallback" | None
+    "location_source": None,   # "gnss" | "fallback" | "last_known" | None
     "last_gnss_fix_time": None,
+    "last_known_valid_lat": None,
+    "last_known_valid_lon": None,
+    "last_known_valid_heading": None,
+    "last_known_valid_timestamp": None,
     "imu": None,
     "serial_connected": False,
     "serial_port": None,
@@ -93,27 +100,15 @@ MONTH_MAP = {
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
 }
 
-
-# ---- 14 Houses Catalog & Landmarks for Field Debugging ----
-AMRAVATI_HOUSES = [
-    {"id": "H-AMR-01", "name": "COSMO AESTHETIC / Vrushangi Modular", "lat": 20.9558016, "lon": 77.7642758},
-    {"id": "H-AMR-02", "name": "Ambika Provision / Godrej Interio", "lat": 20.9558842, "lon": 77.7641069},
-    {"id": "H-AMR-03", "name": "सुनील जयसिंगपुरे (Education center)", "lat": 20.9559889, "lon": 77.7638930},
-    {"id": "H-AMR-04", "name": "Dr. Kishorsingh Chungade Clinic", "lat": 20.9560605, "lon": 77.7637466},
-    {"id": "H-AMR-05", "name": "Khond's House", "lat": 20.9561282, "lon": 77.7635980},
-    {"id": "H-AMR-06", "name": "Residential House (Khond Adjacent)", "lat": 20.9561943, "lon": 77.7634629},
-    {"id": "H-AMR-07", "name": "Shree Ganesh Apartment", "lat": 20.9562564, "lon": 77.7633255},
-    {"id": "H-AMR-08", "name": "Wellness MEDeal Generic Pharmacy / Dr DEEPAK KEDAR", "lat": 20.9559766, "lon": 77.7643740},
-    {"id": "H-AMR-09", "name": "Radhika Fashion / Indrashesh Medicals", "lat": 20.9560593, "lon": 77.7642051},
-    {"id": "H-AMR-10", "name": "Residential Plot 1", "lat": 20.9561419, "lon": 77.7640362},
-    {"id": "H-AMR-11", "name": "Residential Plot 2", "lat": 20.9562190, "lon": 77.7638786},
-    {"id": "H-AMR-12", "name": "Residential Plot 3", "lat": 20.9562962, "lon": 77.7637210},
-    {"id": "H-AMR-13", "name": "Sthapatya Consultants (I) Pvt.Ltd", "lat": 20.9563773, "lon": 77.7635655},
-    {"id": "H-AMR-14", "name": "AMF Project Consultant", "lat": 20.9564434, "lon": 77.7634304},
-]
-
-SAFE_ZONE_DEPOT = {"lat": 20.928816, "lon": 77.7514375, "radius_m": 20.0}
-STRAIGHT_ROAD_MID = {"lat": 20.95612, "lon": 77.76385, "corridor_radius_m": 60.0}
+# Dynamic GIS & Operational Session Metadata (Fetched dynamically from Backend API)
+dynamic_houses = []
+dynamic_roads = []
+dynamic_session_info = {
+    "sessionId": 0,
+    "ulbId": DEFAULT_ULB_ID,
+    "vehicleReg": DEFAULT_VEHICLE_ID,
+    "deviceId": DEFAULT_DEVICE_ID
+}
 
 field_state = {
     "in_depot": None,
@@ -124,6 +119,143 @@ field_state = {
     "last_dist_log_time": 0.0,
 }
 
+def auto_detect_backend_url(candidate=None):
+    """Automatically discovers and connects to the active SWSTP backend API."""
+    candidates = []
+    if candidate:
+        candidates.append(candidate)
+    if "SWSTP_BACKEND_URL" in os.environ:
+        candidates.append(os.environ["SWSTP_BACKEND_URL"])
+    candidates.extend([
+        "https://solidwasteapi.scipl.info.in",
+        "http://localhost:5000",
+        "http://127.0.0.1:5000",
+        "http://localhost:5244"
+    ])
+    for u in candidates:
+        try:
+            r = requests.get(f"{u.rstrip('/')}/api/gis/roads?ulbId={DEFAULT_ULB_ID}", timeout=3.0)
+            if r.status_code in (200, 401, 403, 404):
+                return u
+        except Exception:
+            continue
+    return candidate or "https://solidwasteapi.scipl.info.in"
+
+def sync_backend_metadata(backend_url, ulb_id):
+    """Dynamically synchronizes registered ULBs, houses, roads, and active sessions from Backend API."""
+    global dynamic_houses, dynamic_roads, dynamic_session_info
+    base = backend_url.rstrip('/')
+
+    # 1. Resolve ULB dynamically
+    resolved_ulb = ulb_id if (ulb_id and ulb_id != "AUTO") else "ULB_MH_AMRAVATI"
+    try:
+        r_ulbs = requests.get(f"{base}/api/admin/ulbs", timeout=2.0)
+        if r_ulbs.status_code == 200:
+            ulbs_data = r_ulbs.json()
+            if isinstance(ulbs_data, list) and len(ulbs_data) > 0:
+                first_ulb = ulbs_data[0].get("ulbId") or ulbs_data[0].get("id")
+                if first_ulb and (not ulb_id or ulb_id == "AUTO"):
+                    resolved_ulb = first_ulb
+    except Exception:
+        pass
+    dynamic_session_info["ulbId"] = resolved_ulb
+
+    # 2. Fetch dynamic houses from API
+    try:
+        r_houses = requests.get(f"{base}/api/gis/houses?ulbId={resolved_ulb}", timeout=3.0)
+        if r_houses.status_code == 200:
+            data = r_houses.json()
+            if isinstance(data, list) and len(data) > 0:
+                dynamic_houses = [
+                    {
+                        "id": h.get("houseId") or f"H-{i+1}",
+                        "name": h.get("address") or h.get("houseId") or f"House {i+1}",
+                        "lat": float(h.get("latitude", 0)),
+                        "lon": float(h.get("longitude", 0))
+                    }
+                    for i, h in enumerate(data)
+                    if h.get("latitude") and h.get("longitude")
+                ]
+                print(f"[API METADATA] Synchronized {len(dynamic_houses)} registered houses from DB (ULB: {resolved_ulb}).")
+    except Exception as ex:
+        print(f"[API METADATA NOTE] Houses sync note: {ex}")
+
+    # 3. Fetch dynamic roads from API
+    try:
+        r_roads = requests.get(f"{base}/api/gis/roads?ulbId={resolved_ulb}", timeout=3.0)
+        if r_roads.status_code == 200:
+            data = r_roads.json()
+            if isinstance(data, list):
+                dynamic_roads = data
+                print(f"[API METADATA] Synchronized {len(dynamic_roads)} road geometry layers from DB.")
+    except Exception as ex:
+        print(f"[API METADATA NOTE] Roads sync note: {ex}")
+
+    # 4. Fetch dynamic safe zones from API
+    global dynamic_safe_zones
+    try:
+        r_safe = requests.get(f"{base}/api/gis/safe-zones?ulbId={resolved_ulb}", timeout=3.0)
+        if r_safe.status_code == 200:
+            data = r_safe.json()
+            if isinstance(data, list) and len(data) > 0:
+                dynamic_safe_zones = data
+                print(f"[API METADATA] Synchronized {len(dynamic_safe_zones)} safe zones from DB (ULB: {resolved_ulb}).")
+    except Exception as ex:
+        print(f"[API METADATA NOTE] Safe zones sync note: {ex}")
+
+    # 5. Discover Active Session & Vehicle from API if exists
+    try:
+        r_sess = requests.get(f"{base}/api/officer/sessions?ulbId={resolved_ulb}&status=ACTIVE", timeout=3.0)
+        if r_sess.status_code == 200:
+            sessions = r_sess.json()
+            if isinstance(sessions, list) and len(sessions) > 0:
+                active_s = sessions[0]
+                sid = active_s.get("operationalSessionId") or active_s.get("sessionId") or 0
+                dynamic_session_info["sessionId"] = sid
+                dynamic_session_info["vehicleReg"] = active_s.get("vehicleRegistrationNumber") or dynamic_session_info["vehicleReg"]
+                dynamic_session_info["ulbId"] = active_s.get("ulbId") or resolved_ulb
+                dynamic_session_info["deviceId"] = active_s.get("deviceCode") or active_s.get("deviceId") or dynamic_session_info["deviceId"]
+                latest_sensor["active_session_id"] = sid
+                hardware_state["backend"]["active_session_id"] = sid
+                print(f"[API METADATA] Existing Active Session detected: #{sid} (Vehicle: {dynamic_session_info['vehicleReg']})")
+    except Exception as ex:
+        print(f"[API METADATA NOTE] Active session sync note: {ex}")
+
+def ensure_hardware_session(backend_url, device_code):
+    """Dynamically activates or binds the hardware session in the DB for the identified device."""
+    global dynamic_session_info
+    if not device_code or device_code in ("AUTO", "UNASSIGNED", "DISCONNECTED"):
+        return 0
+
+    base = backend_url.rstrip('/')
+    try:
+        r = requests.post(
+            f"{base}/api/sessions/start-hardware-session",
+            json={"deviceCode": device_code, "mode": "REAL_HARDWARE"},
+            timeout=3.0
+        )
+        if r.status_code == 200:
+            sess = r.json()
+            sid = sess.get("sessionId") or 0
+            if sid > 0:
+                dynamic_session_info["sessionId"] = sid
+                dynamic_session_info["vehicleReg"] = sess.get("vehicleRegistrationNumber") or (sess.get("vehicle") or {}).get("registrationNumber") or dynamic_session_info["vehicleReg"]
+                dynamic_session_info["ulbId"] = sess.get("ulbId") or (sess.get("ulb") or {}).get("ulbId") or dynamic_session_info["ulbId"]
+                dynamic_session_info["deviceId"] = device_code
+                latest_sensor["active_session_id"] = sid
+                hardware_state["backend"]["active_session_id"] = sid
+
+                # Synchronize sequence number to prevent duplicate key collision with existing DB packets
+                last_seq = sess.get("lastSequenceNumber") or sess.get("maxSequenceNumber") or 0
+                if last_seq > latest_sensor.get("sequence", 0):
+                    latest_sensor["sequence"] = int(last_seq)
+
+                print(f"[SESSION BIND] Dynamic Telemetry Session #{sid} active for Vehicle '{dynamic_session_info['vehicleReg']}' (Device: {device_code}) [LastSeq: {latest_sensor['sequence']}]")
+                return sid
+    except Exception as ex:
+        print(f"[SESSION BIND NOTE] Session creation note: {ex}")
+    return dynamic_session_info.get("sessionId", 0)
+
 def haversine_dist_meters(lat1, lon1, lat2, lon2):
     R = 6371000.0
     p1, p2 = np.radians(lat1), np.radians(lat2)
@@ -132,14 +264,147 @@ def haversine_dist_meters(lat1, lon1, lat2, lon2):
     a = np.sin(dp / 2.0)**2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2.0)**2
     return R * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
+gps_sliding_window = []  # [(lat, lon, timestamp), ...]
+last_known_gps_heading = None
+
+def angular_distance(a, b):
+    """Calculates the minimal circular distance between two angles in degrees (0 - 180)."""
+    if a is None or b is None:
+        return 0.0
+    diff = abs(float(a) - float(b)) % 360.0
+    return min(diff, 360.0 - diff)
+
+def compute_heading_from_gps_history(raw_lat, raw_lon, in_safe_zone=False, is_snapped=False, road_bearing=None):
+    """Calculates context-aware vehicle motion heading:
+    - Outside Safe Zone & Snapped to Road: Aligns parallel to winning road segment (forward vs reverse).
+    - Inside Safe Zone or Off-Road: Follows raw GPS displacement vector.
+    - Stationary (displacement < 0.8m): Holds previous valid heading without jitter.
+    """
+    global gps_sliding_window, last_known_gps_heading
+    if raw_lat is None or raw_lon is None or (abs(raw_lat) < 0.001 and abs(raw_lon) < 0.001):
+        return last_known_gps_heading
+
+    now = time.monotonic()
+    gps_sliding_window.append((float(raw_lat), float(raw_lon), now))
+    # Retain fixes across 2-4 second sliding window (3-4 points)
+    gps_sliding_window = [p for p in gps_sliding_window if now - p[2] <= 4.5][-8:]
+
+    if len(gps_sliding_window) >= 2:
+        old_lat, old_lon, _ = gps_sliding_window[0]
+        lat_scale = 111320.0
+        lon_scale = 111320.0 * np.cos(np.radians(raw_lat))
+
+        dx = (raw_lon - old_lon) * lon_scale
+        dy = (raw_lat - old_lat) * lat_scale
+        dist = np.hypot(dx, dy)
+
+        if dist >= 0.8:
+            travel_angle = float(np.degrees(np.arctan2(dx, dy)))
+            if travel_angle < 0:
+                travel_angle += 360.0
+
+            # 1. Inside Safe Zone or Unsnapped Off-Road -> Direct GPS Travel Vector
+            if in_safe_zone or (not is_snapped) or road_bearing is None:
+                last_known_gps_heading = travel_angle
+                return travel_angle
+
+            # 2. Outside Safe Zone along Road Corridor -> Align parallel to Road Segment
+            rev_bearing = (road_bearing + 180.0) % 360.0
+            diff_fwd = angular_distance(travel_angle, road_bearing)
+            diff_rev = angular_distance(travel_angle, rev_bearing)
+
+            aligned_heading = road_bearing if diff_fwd <= diff_rev else rev_bearing
+            last_known_gps_heading = aligned_heading
+            return aligned_heading
+
+    return last_known_gps_heading
+
 def get_nearest_house(lat, lon):
     best_h, best_dist = None, 999999.0
-    for h in AMRAVATI_HOUSES:
+    for h in dynamic_houses:
         d = haversine_dist_meters(lat, lon, h["lat"], h["lon"])
         if d < best_dist:
             best_dist = d
             best_h = h
     return best_h, best_dist
+
+dynamic_safe_zones = [
+    {"ulbId": "ULB_MH_AMRAVATI", "lat": 20.928816, "lon": 77.7514375, "radius": 1000.0}
+]
+
+def is_in_safe_zone(lat, lon):
+    """Checks if coordinates fall inside any configured ULB safe zone (depot / garage)."""
+    if lat is None or lon is None:
+        return False
+    for sz in dynamic_safe_zones:
+        sz_lat = sz.get("lat") or sz.get("latitude")
+        sz_lon = sz.get("lon") or sz.get("longitude")
+        radius = sz.get("radius") or sz.get("radiusMeters") or 1000.0
+        if sz_lat is not None and sz_lon is not None:
+            d = haversine_dist_meters(lat, lon, sz_lat, sz_lon)
+            if d <= radius:
+                return True
+    return False
+
+def snap_coordinates_to_road(lat, lon):
+    """Projects raw or drifted GPS coordinates directly onto the road centerline so all stored telemetry and collection circles are 100% on the road, UNLESS the vehicle is inside a safe zone.
+    Returns: (display_lat, display_lon, is_inside_safe_zone, is_snapped, road_bearing)
+    """
+    if lat is None or lon is None or not dynamic_roads:
+        return lat, lon, False, False, None
+
+    # Safe Zone Exemption: Do NOT snap to road if vehicle is inside a safe zone (depot / yard)
+    in_sz = is_in_safe_zone(lat, lon)
+    if in_sz:
+        return lat, lon, True, False, None
+
+    best_lat, best_lon = lat, lon
+    best_road_bearing = None
+    min_dist = float("inf")
+
+    ref_lat = dynamic_roads[0]["coordinates"][0][0]
+    ref_lon = dynamic_roads[0]["coordinates"][0][1]
+    lat_scale = 111320.0
+    lon_scale = 111320.0 * math.cos(math.radians(ref_lat))
+
+    px = (lon - ref_lon) * lon_scale
+    py = (lat - ref_lat) * lat_scale
+
+    for road in dynamic_roads:
+        coords = road.get("coordinates") or []
+        for i in range(len(coords) - 1):
+            a_lat, a_lon = coords[i]
+            b_lat, b_lon = coords[i + 1]
+
+            ax = (a_lon - ref_lon) * lon_scale
+            ay = (a_lat - ref_lat) * lat_scale
+            bx = (b_lon - ref_lon) * lon_scale
+            by = (b_lat - ref_lat) * lat_scale
+
+            dx, dy = bx - ax, by - ay
+            l2 = dx * dx + dy * dy
+            if l2 < 1e-6:
+                t = 0.0
+            else:
+                t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+
+            proj_x = ax + t * dx
+            proj_y = ay + t * dy
+            dist = math.hypot(px - proj_x, py - proj_y)
+
+            if dist < min_dist:
+                min_dist = dist
+                best_lat = ref_lat + proj_y / lat_scale
+                best_lon = ref_lon + proj_x / lon_scale
+                seg_bearing = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+                best_road_bearing = seg_bearing
+
+    # If within 80m corridor of the road, snap permanently to centerline
+    if min_dist <= 80.0:
+        is_snapped = (abs(best_lat - lat) > 1e-7 or abs(best_lon - lon) > 1e-7)
+        return best_lat, best_lon, False, is_snapped, best_road_bearing
+
+    return lat, lon, False, False, None
 
 def track_field_events(lat, lon, speed, heading):
     if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
@@ -148,61 +413,34 @@ def track_field_events(lat, lon, speed, heading):
     now = time.monotonic()
     active_sid = latest_sensor.get("active_session_id", 0)
 
-    # 1. Safe Zone Depot (20.928816, 77.7514375)
-    depot_dist = haversine_dist_meters(lat, lon, SAFE_ZONE_DEPOT["lat"], SAFE_ZONE_DEPOT["lon"])
-    in_depot = depot_dist <= SAFE_ZONE_DEPOT["radius_m"]
-    if field_state["in_depot"] != in_depot:
-        field_state["in_depot"] = in_depot
-        if in_depot:
-            print("\n" + "=" * 65)
-            print(f"[FIELD LOG] 🛡 REST POSITION REACHED: Vehicle parked in Safe Zone Depot")
-            print(f"            Depot Coord: (20.928816, 77.7514375) | Dist: {depot_dist:.1f}m (Radius: 20m)")
-            print(f"            Session ID:  #{active_sid}")
-            print("=" * 65 + "\n")
-        else:
-            print(f"\n[FIELD LOG] 🚀 DEPOT DEPARTURE: Left Safe Zone Depot -> Starting Mission (Speed: {speed:.1f} km/h, Heading: {heading:.0f}°)\n")
-
-    # 2. Straight Road Corridor Entry / Exit
-    road_dist = haversine_dist_meters(lat, lon, STRAIGHT_ROAD_MID["lat"], STRAIGHT_ROAD_MID["lon"])
-    in_corridor = road_dist <= STRAIGHT_ROAD_MID["corridor_radius_m"]
-    if field_state["in_corridor"] != in_corridor:
-        field_state["in_corridor"] = in_corridor
-        if in_corridor:
-            print("\n" + "=" * 65)
-            print(f"[FIELD LOG] 🛣 APPROACHING STREET: Entered Siddhivinayak Nagar Internal Lane")
-            print(f"            Corridor Dist: {road_dist:.1f}m | Speed: {speed:.1f} km/h | Heading: {heading:.0f}°")
-            print(f"            Active Session: #{active_sid}")
-            print("=" * 65 + "\n")
-        else:
-            print(f"\n[FIELD LOG] 🏁 STREET CORRIDOR EXITED: Left collection street corridor (Dist: {road_dist:.1f}m)\n")
-
-    # 3. Vehicle Stop / House Proximity & Marking
+    # Dynamic Vehicle Stop / House Proximity & 10m Collection Zone
     is_stopped = (speed <= 3.5)
     near_house, house_dist = get_nearest_house(lat, lon)
 
     if field_state["is_stopped"] != is_stopped:
         field_state["is_stopped"] = is_stopped
         if is_stopped:
-            if near_house and house_dist <= 12.0:
+            if near_house and house_dist <= 15.0:
                 h_id = near_house["id"]
                 field_state["marked_houses"].add(h_id)
                 print("\n" + "=" * 65)
                 print(f"[FIELD LOG] 🛑 VEHICLE STOP AT HOUSE: {h_id} - {near_house['name']}")
-                print(f"            Proximity Dist: {house_dist:.1f}m (Threshold <= 10m) | Speed: {speed:.1f} km/h")
-                print(f"            🏠 HOUSE MARKED AS COLLECTED (GIS Map Status -> GREEN)")
-                print(f"            Total Houses Collected: {len(field_state['marked_houses'])} / {len(AMRAVATI_HOUSES)}")
+                print(f"            Proximity Dist: {house_dist:.1f}m (Threshold <= 15m) | Speed: {speed:.1f} km/h")
+                print(f"            🏠 HOUSE MARKED AS COLLECTED (GIS Map Status -> SOLID GREEN)")
+                print(f"            Total Houses Collected: {len(field_state['marked_houses'])} / {len(dynamic_houses)}")
                 print(f"            Active Session: #{active_sid}")
                 print("=" * 65 + "\n")
             else:
-                print(f"\n[FIELD LOG] 🛑 VEHICLE STOPPED at ({lat:.6f}, {lon:.6f}) | Speed: {speed:.1f} km/h | Road Dist: {road_dist:.1f}m\n")
+                print(f"\n[FIELD LOG] 🛑 VEHICLE STOPPED at ({lat:.6f}, {lon:.6f}) | Speed: {speed:.1f} km/h\n")
         else:
             print(f"\n[FIELD LOG] 🚚 LEAVING STOP / MOVING: Resumed motion at {speed:.1f} km/h (Heading: {heading:.0f}°)\n")
 
-    # Periodic proximity heartbeat when moving inside corridor
-    elif in_corridor and (now - field_state["last_dist_log_time"]) >= 5.0:
-        field_state["last_dist_log_time"] = now
-        if near_house:
-            print(f"[FIELD PROXIMITY] In street corridor | Nearest: {near_house['id']} ({near_house['name']}) @ {house_dist:.1f}m | Speed: {speed:.1f} km/h")
+    # Periodic proximity heartbeat when near registered building (5s when moving, 30s when stopped)
+    elif near_house and house_dist <= 25.0:
+        heartbeat_interval = 30.0 if is_stopped else 5.0
+        if (now - field_state["last_dist_log_time"]) >= heartbeat_interval:
+            field_state["last_dist_log_time"] = now
+            print(f"[FIELD PROXIMITY] Nearest House: {near_house['id']} ({near_house['name']}) @ {house_dist:.1f}m | Speed: {speed:.1f} km/h")
 
 
 def log_hardware(component, status, details=""):
@@ -219,8 +457,8 @@ def list_serial_ports():
     return list(serial.tools.list_ports.comports())
 
 
-def find_arduino_port(preferred_port="COM3"):
-    """Finds the best candidate serial port for Arduino/ESP32."""
+def find_arduino_port(preferred_port="AUTO"):
+    """Finds genuine USB-to-Serial port for Arduino/ESP32 (CH340, CP2102, FTDI, CDC)."""
     available_ports = list_serial_ports()
     if not available_ports:
         return None, []
@@ -230,32 +468,20 @@ def find_arduino_port(preferred_port="COM3"):
             if p.device.upper() == preferred_port.upper():
                 return p.device, available_ports
 
-    keywords = ["arduino", "ch340", "ch341", "cp210", "ftdi", "usb", "serial", "acm", "prolific", "esp32"]
-    usb_candidates = []
-
+    usb_keywords = ["arduino", "ch340", "ch341", "cp210", "ftdi", "usb serial", "usb-serial", "usb cdc", "wchusb", "silicon labs", "esp32", "usb\\vid"]
+    
     for p in available_ports:
         hwid = (p.hwid or "").lower()
         desc = (p.description or "").lower()
-        dev = p.device.upper()
 
-        if "bthenum" in hwid or "bluetooth" in desc:
-            continue
-        if dev == "COM1" and not any(kw in desc for kw in ["usb", "arduino", "ch340"]):
+        # Explicitly skip motherboard PCI / Intel AMT / Bluetooth ports
+        if "pci\\ven" in hwid or "intel(r) active management" in desc or "bthenum" in hwid or "bluetooth" in desc:
             continue
 
-        if any(kw in desc or kw in hwid for kw in keywords):
-            usb_candidates.append(p)
-
-    if usb_candidates:
-        return usb_candidates[0].device, available_ports
-
-    for p in available_ports:
-        hwid = (p.hwid or "").lower()
-        desc = (p.description or "").lower()
-        if "bluetooth" not in desc and "bthenum" not in hwid:
+        if any(kw in desc or kw in hwid for kw in usb_keywords) or hwid.startswith("usb\\"):
             return p.device, available_ports
 
-    return available_ports[0].device, available_ports
+    return None, available_ports
 
 
 def normalize_datetime(year, month, day, hour=0, minute=0, second=0):
@@ -375,7 +601,16 @@ def parse_serial_line(line):
         try:
             telemetry = json.loads(json_candidate)
             if isinstance(telemetry, dict):
-                # Parse RTC
+                # Parse Device ID if emitted by hardware MCU EEPROM
+                hw_dev = telemetry.get("device_id") or telemetry.get("deviceId") or telemetry.get("deviceCode") or telemetry.get("device")
+                if hw_dev and str(hw_dev).strip():
+                    dev_str = str(hw_dev).strip()
+                    if dynamic_session_info.get("deviceId") != dev_str or not dynamic_session_info.get("sessionId"):
+                        dynamic_session_info["deviceId"] = dev_str
+                        latest_sensor["deviceId"] = dev_str
+                        backend_url = auto_detect_backend_url(DEFAULT_BACKEND_URL)
+                        sid = ensure_hardware_session(backend_url, dev_str)
+                        log_hardware("HARDWARE MCU IDENTITY", "MATCHED & SESSION BOUND", f"Device ID: {dev_str} -> Active Session #{sid}")
                 if "rtc" in telemetry and isinstance(telemetry["rtc"], dict):
                     rtc_obj = telemetry["rtc"]
                     raw_ts = rtc_obj.get("timestamp") or rtc_obj.get("iso")
@@ -413,19 +648,37 @@ def parse_serial_line(line):
                         try:
                             lat_val = float(lat)
                             lon_val = float(lon)
-                            if not hardware_state["gps"]["logged_fix"] and (abs(lat_val) > 0.001 and abs(lon_val) > 0.001):
-                                hardware_state["gps"]["fix"] = True
-                                hardware_state["gps"]["logged_fix"] = True
-                                log_hardware("GPS MODULE (NEO-6M)", "SATELLITE FIX ACQUIRED", f"Lat: {lat_val:.6f}, Lon: {lon_val:.6f}")
-                            latest_sensor["lat"] = lat_val
-                            latest_sensor["lon"] = lon_val
-                            latest_sensor["speed"] = float(speed or 0.0)
-                            latest_sensor["heading"] = float(heading or 0.0)
-                            latest_sensor["satellites"] = int(satellites or 0)
-                            latest_sensor["gps_valid"] = True
-                            latest_sensor["location_source"] = "gnss"
-                            latest_sensor["last_gnss_fix_time"] = time.monotonic()
-                            parsed_something = True
+                            if (abs(lat_val) > 0.001 and abs(lon_val) > 0.001):
+                                raw_lat, raw_lon = lat_val, lon_val
+                                latest_sensor["raw_gps_lat"] = raw_lat
+                                latest_sensor["raw_gps_lon"] = raw_lon
+
+                                snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = snap_coordinates_to_road(raw_lat, raw_lon)
+                                lat_val, lon_val = snapped_lat, snapped_lon
+                                dist_drift = haversine_dist_meters(raw_lat, raw_lon, snapped_lat, snapped_lon)
+
+                                latest_sensor["is_inside_safe_zone"] = in_sz
+                                latest_sensor["is_snapped"] = is_snapped
+                                latest_sensor["road_bearing"] = road_bearing
+
+                                if not hardware_state["gps"]["logged_fix"]:
+                                    hardware_state["gps"]["fix"] = True
+                                    hardware_state["gps"]["logged_fix"] = True
+                                    log_hardware(
+                                        "GPS MODULE (NEO-6M)", "SATELLITE FIX & ROAD SNAP",
+                                        f"Raw GPS: ({raw_lat:.6f}, {raw_lon:.6f}) -> Road Centerline: ({snapped_lat:.6f}, {snapped_lon:.6f}) [Snapping Drift: {dist_drift:.1f}m | SafeZone: {in_sz} | Snapped: {is_snapped} | RoadBearing: {road_bearing}]"
+                                    )
+                                latest_sensor["lat"] = lat_val
+                                latest_sensor["lon"] = lon_val
+                                latest_sensor["last_known_valid_lat"] = lat_val
+                                latest_sensor["last_known_valid_lon"] = lon_val
+                                latest_sensor["speed"] = float(speed or 0.0)
+                                latest_sensor["heading"] = float(heading or 0.0)
+                                latest_sensor["satellites"] = int(satellites or 0)
+                                latest_sensor["gps_valid"] = True
+                                latest_sensor["location_source"] = "gnss"
+                                latest_sensor["last_gnss_fix_time"] = time.monotonic()
+                                parsed_something = True
                         except ValueError:
                             pass
 
@@ -456,8 +709,15 @@ def parse_serial_line(line):
                     lat_val = float(lat_str)
                     lon_val = float(lon_str)
                     if -90 <= lat_val <= 90 and -180 <= lon_val <= 180 and (abs(lat_val) > 0.001 and abs(lon_val) > 0.001):
-                        latest_sensor["lat"] = lat_val
-                        latest_sensor["lon"] = lon_val
+                        raw_lat, raw_lon = lat_val, lon_val
+                        latest_sensor["raw_gps_lat"] = raw_lat
+                        latest_sensor["raw_gps_lon"] = raw_lon
+                        snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = snap_coordinates_to_road(raw_lat, raw_lon)
+                        latest_sensor["is_inside_safe_zone"] = in_sz
+                        latest_sensor["is_snapped"] = is_snapped
+                        latest_sensor["road_bearing"] = road_bearing
+                        latest_sensor["lat"] = snapped_lat
+                        latest_sensor["lon"] = snapped_lon
                         latest_sensor["gps_valid"] = True
                         latest_sensor["location_source"] = "gnss"
                         latest_sensor["last_gnss_fix_time"] = time.monotonic()
@@ -468,7 +728,26 @@ def parse_serial_line(line):
     # Sequential queueing for smooth, monotonic telemetry delivery
     if parsed_something:
         if latest_sensor["gps_valid"] and latest_sensor["lat"] is not None and latest_sensor["lon"] is not None:
-            track_field_events(latest_sensor["lat"], latest_sensor["lon"], latest_sensor.get("speed", 0.0), latest_sensor.get("heading", 0.0))
+            raw_lat = latest_sensor.get("raw_gps_lat", latest_sensor["lat"])
+            raw_lon = latest_sensor.get("raw_gps_lon", latest_sensor["lon"])
+            in_sz = latest_sensor.get("is_inside_safe_zone", False)
+            is_snapped = latest_sensor.get("is_snapped", False)
+            road_bearing = latest_sensor.get("road_bearing")
+
+            calculated_heading = compute_heading_from_gps_history(
+                raw_lat, raw_lon,
+                in_safe_zone=in_sz,
+                is_snapped=is_snapped,
+                road_bearing=road_bearing
+            )
+            if calculated_heading is not None:
+                latest_sensor["heading"] = calculated_heading
+
+            latest_sensor["last_known_valid_lat"] = latest_sensor["lat"]
+            latest_sensor["last_known_valid_lon"] = latest_sensor["lon"]
+            latest_sensor["last_known_valid_heading"] = latest_sensor["heading"]
+            latest_sensor["last_known_valid_timestamp"] = time.time()
+            track_field_events(latest_sensor["lat"], latest_sensor["lon"], latest_sensor.get("speed", 0.0), latest_sensor["heading"])
 
         now_epoch_ms = int(time.time() * 1000)
         iso_time = latest_sensor["timestamp"] or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -511,42 +790,60 @@ def parse_serial_line(line):
     return parsed_something
 
 
-def serial_reader(port_arg, baud_rate, stop_event):
-    """Runs in background thread, auto-connects to serial port, reads lines."""
-    global latest_sensor, hardware_state
-
-    reconnect_delay = 3.0
-    current_port = port_arg
+def serial_reader(preferred_port, baud_rate, stop_event, active_ser=None):
+    """Continuously reads telemetry from Arduino/ESP32 serial connection."""
+    global hardware_state, latest_sensor
+    current_port = preferred_port
+    reconnect_delay = 2.0
     last_logged_target = None
+    first_run = True
 
     while not stop_event.is_set():
-        available = list_serial_ports()
-        latest_sensor["available_ports"] = [p.device for p in available]
-
-        target_port, port_objs = find_arduino_port(current_port)
-        if not target_port:
-            latest_sensor["serial_connected"] = False
-            latest_sensor["serial_port"] = None
-            hardware_state["serial"]["connected"] = False
-            stop_event.wait(reconnect_delay)
-            continue
-
-        port_descriptions = ", ".join([f"{p.device} ({p.description})" for p in port_objs])
-        if last_logged_target != target_port:
-            print(f"[SERIAL] Connecting to {target_port} @ {baud_rate} baud...")
-            last_logged_target = target_port
-
-        ser = None
-        try:
-            ser = serial.Serial(port=target_port, baudrate=baud_rate, timeout=1.0)
-            time.sleep(1.5)
-            ser.reset_input_buffer()
-
+        if first_run and active_ser and active_ser.is_open:
+            ser = active_ser
+            first_run = False
+            target_port = preferred_port or ser.port
             latest_sensor["serial_connected"] = True
             latest_sensor["serial_port"] = target_port
-            hardware_state["serial"] = {"connected": True, "port": target_port, "baud": baud_rate, "desc": port_descriptions}
-            log_hardware("SERIAL BRIDGE", "CONNECTED", f"Serial link active on {target_port} at {baud_rate} baud.")
+            hardware_state["serial"] = {"connected": True, "port": target_port, "baud": baud_rate, "desc": "Active Hardware Link"}
+            log_hardware("SERIAL BRIDGE", "ACTIVE", f"Continuous streaming on {target_port} @ {baud_rate} baud.")
+        else:
+            first_run = False
+            available = list_serial_ports()
+            latest_sensor["available_ports"] = [p.device for p in available]
 
+            target_port, port_objs = find_arduino_port(current_port)
+            if not target_port:
+                latest_sensor["serial_connected"] = False
+                latest_sensor["serial_port"] = None
+                hardware_state["serial"]["connected"] = False
+                stop_event.wait(reconnect_delay)
+                continue
+
+            port_descriptions = ", ".join([f"{p.device} ({p.description})" for p in port_objs])
+            if last_logged_target != target_port:
+                print(f"[SERIAL] Connecting to {target_port} @ {baud_rate} baud...")
+                last_logged_target = target_port
+
+            ser = None
+            try:
+                ser = serial.Serial(port=target_port, baudrate=baud_rate, timeout=1.0)
+                time.sleep(1.2)
+                ser.reset_input_buffer()
+
+                latest_sensor["serial_connected"] = True
+                latest_sensor["serial_port"] = target_port
+                hardware_state["serial"] = {"connected": True, "port": target_port, "baud": baud_rate, "desc": port_descriptions}
+                log_hardware("SERIAL BRIDGE", "CONNECTED", f"Serial link active on {target_port} at {baud_rate} baud.")
+            except Exception as e:
+                latest_sensor["serial_connected"] = False
+                latest_sensor["serial_port"] = None
+                hardware_state["serial"]["connected"] = False
+                print(f"[SERIAL WAIT] Could not open {target_port}: {e}")
+                stop_event.wait(reconnect_delay)
+                continue
+
+        try:
             while not stop_event.is_set() and ser.is_open:
                 try:
                     raw_bytes = ser.readline()
@@ -556,14 +853,18 @@ def serial_reader(port_arg, baud_rate, stop_event):
                     if line:
                         latest_sensor["last_raw_line"] = line
                         parse_serial_line(line)
-                except (serial.SerialException, Exception):
-                    break
-
-        except Exception as e:
-            latest_sensor["serial_connected"] = False
-            latest_sensor["serial_port"] = None
-            hardware_state["serial"]["connected"] = False
-            print(f"[SERIAL WAIT] Could not open {target_port}: {e}")
+                except (serial.SerialException, Exception) as ex:
+                    print("\n" + "=" * 76)
+                    print(" [FATAL ERROR] HARDWARE DISCONNECTED!")
+                    print(" " + "-" * 74)
+                    print(f" Physical microcontroller unit was disconnected ({ex}).")
+                    print(" SWSTP Edge Gateway requires connected hardware to operate.")
+                    print(" Program is terminating.")
+                    print("=" * 76 + "\n")
+                    stop_event.set()
+                    os._exit(1)
+        except Exception:
+            pass
         finally:
             if ser and ser.is_open:
                 try:
@@ -579,10 +880,10 @@ def serial_reader(port_arg, baud_rate, stop_event):
 
 # ─── Live Camera Frame Streamer Thread (POST /api/camera/{deviceId}/frame) ───
 def live_frame_streamer(backend_url, device_id, fps, stop_event):
-    """Pushes live JPEG frames to Backend at high framerate (up to 30+ FPS) using Keep-Alive."""
+    """Pushes live JPEG frames to Backend at targeted low-latency FPS (10-15 FPS) using Keep-Alive."""
     global latest_frame_jpeg, hardware_state
-    url = f"{backend_url.rstrip('/')}/api/camera/{device_id}/frame"
-    interval = 1.0 / max(0.2, fps)
+    target_fps = max(1.0, min(30.0, fps))
+    interval = 1.0 / target_fps
 
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=0)
@@ -590,18 +891,24 @@ def live_frame_streamer(backend_url, device_id, fps, stop_event):
     session.mount("https://", adapter)
 
     logged_first_ok = False
-    logged_first_fail = False
+    last_sent_bytes_id = None
 
     while not stop_event.is_set():
+        loop_start = time.time()
         frame_bytes = None
+
+        # Fetch latest pending frame (1 slot, zero queue buildup)
         with latest_frame_lock:
-            if latest_frame_jpeg is not None:
+            if latest_frame_jpeg is not None and id(latest_frame_jpeg) != last_sent_bytes_id:
                 frame_bytes = latest_frame_jpeg
+                last_sent_bytes_id = id(latest_frame_jpeg)
 
         if frame_bytes:
             try:
+                cur_dev = latest_sensor.get("deviceId") or dynamic_session_info.get("deviceId") or device_id
+                stream_url = f"{backend_url.rstrip('/')}/api/camera/{cur_dev}/frame"
                 resp = session.post(
-                    url,
+                    stream_url,
                     data=frame_bytes,
                     headers={"Content-Type": "image/jpeg", "Connection": "keep-alive"},
                     timeout=1.0
@@ -611,20 +918,14 @@ def live_frame_streamer(backend_url, device_id, fps, stop_event):
                     hardware_state["backend"]["last_ping"] = time.time()
                     if not logged_first_ok:
                         logged_first_ok = True
-                        logged_first_fail = False
-                        print(f"\n[CAMERA STREAM] Active -> Streaming frames to {url} @ {fps:.1f} FPS (HTTP 200 OK)\n")
-                else:
-                    hardware_state["backend"]["connected"] = False
-                    if not logged_first_fail:
-                        logged_first_fail = True
-                        print(f"\n[CAMERA STREAM WARNING] Backend responded HTTP {resp.status_code}: {resp.text}\n")
-            except Exception as ex:
+                        print(f"\n[CAMERA STREAM] Active -> Streaming frames to {stream_url} @ {target_fps:.1f} FPS (HTTP 200 OK)\n")
+            except Exception:
                 hardware_state["backend"]["connected"] = False
-                if not logged_first_fail:
-                    logged_first_fail = True
-                    print(f"\n[CAMERA STREAM ERROR] Cannot connect to {url}: {ex}\n")
+                time.sleep(0.5)
 
-        stop_event.wait(interval)
+        elapsed = time.time() - loop_start
+        sleep_dur = max(0.005, interval - elapsed)
+        stop_event.wait(sleep_dur)
 
     session.close()
 
@@ -677,7 +978,8 @@ def telemetry_streamer(backend_url, session_id_arg, ulb_id, stop_event):
                 break
 
         if not packets and (latest_sensor["timestamp"] or latest_sensor["gps_valid"] or latest_sensor["imu"]):
-            # Heartbeat packet when idle
+            # Heartbeat packet when idle (increment sequence monotonically)
+            latest_sensor["sequence"] += 1
             now_epoch_ms = int(time.time() * 1000)
             iso_time = latest_sensor["timestamp"] or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             packets.append({
@@ -693,6 +995,12 @@ def telemetry_streamer(backend_url, session_id_arg, ulb_id, stop_event):
                 "gnss": {
                     "lat": latest_sensor["lat"] if latest_sensor["gps_valid"] else None,
                     "lon": latest_sensor["lon"] if latest_sensor["gps_valid"] else None,
+                    "rawLat": latest_sensor.get("raw_gps_lat") if latest_sensor["gps_valid"] else None,
+                    "rawLon": latest_sensor.get("raw_gps_lon") if latest_sensor["gps_valid"] else None,
+                    "displayLat": latest_sensor["lat"] if latest_sensor["gps_valid"] else None,
+                    "displayLon": latest_sensor["lon"] if latest_sensor["gps_valid"] else None,
+                    "isInsideSafeZone": latest_sensor.get("is_inside_safe_zone", False),
+                    "isSnapped": latest_sensor.get("is_snapped", False),
                     "alt": latest_sensor["alt"],
                     "speed": latest_sensor["speed"],
                     "heading": latest_sensor["heading"],
@@ -729,8 +1037,8 @@ def telemetry_streamer(backend_url, session_id_arg, ulb_id, stop_event):
 
 
 # ─── Evidence Upload Worker (POST /api/evidence/upload) ───────────────────────
-def evidence_upload_worker(backend_url, stop_event):
-    """Consumes motion detection captures from queue and uploads to backend."""
+def evidence_upload_worker(backend_url, device_id, ulb_id, stop_event):
+    """Consumes motion detection captures from queue and uploads to backend with full GPS, session, and device metadata."""
     global hardware_state, latest_sensor
     url = f"{backend_url.rstrip('/')}/api/evidence/upload"
 
@@ -753,6 +1061,14 @@ def evidence_upload_worker(backend_url, stop_event):
             width = item.get("width", 1280)
             height = item.get("height", 720)
             compression_quality = item.get("compression_quality", 80)
+            lat = latest_sensor.get("lat")
+            lon = latest_sensor.get("lon")
+            if lat is None or lon is None or (abs(lat) < 0.001 and abs(lon) < 0.001):
+                lat = latest_sensor.get("last_known_valid_lat") or 0.0
+                lon = latest_sensor.get("last_known_valid_lon") or 0.0
+
+            speed = latest_sensor.get("speed") or 0.0
+            active_sid = latest_sensor.get("active_session_id") or dynamic_session_info.get("sessionId") or 0
 
             files = {
                 "file": ("evidence.jpg", jpeg_bytes, "image/jpeg")
@@ -763,28 +1079,57 @@ def evidence_upload_worker(backend_url, stop_event):
                 "width": width,
                 "height": height,
                 "compressionQuality": compression_quality,
-                "idempotencyKey": idempotency_key
+                "idempotencyKey": idempotency_key,
+                "latitude": lat,
+                "longitude": lon,
+                "speedKph": speed,
+                "motionConfidence": 0.95,
+                "sessionId": active_sid,
+                "deviceId": device_id,
+                "ulbId": ulb_id
             }
 
-            resp = session.post(url, files=files, data=data, timeout=8.0)
-            if resp.status_code in (200, 201):
+            resp = None
+            for attempt in range(2):
+                try:
+                    resp = session.post(url, files={"file": ("evidence.jpg", jpeg_bytes, "image/jpeg")}, data=data, timeout=15.0)
+                    if resp.status_code in (200, 201):
+                        break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as req_err:
+                    if attempt == 0:
+                        time.sleep(1.0)
+                        continue
+                    raise req_err
+
+            if resp is not None and resp.status_code in (200, 201):
                 res_json = resp.json()
                 hardware_state["backend"]["upload_count"] += 1
                 img_id = res_json.get("evidenceImageId") or res_json.get("id") or "N/A"
                 img_url = res_json.get("imageUrl") or f"{backend_url.rstrip('/')}/api/evidence/images/{img_id}"
                 
-                near_h, h_dist = get_nearest_house(latest_sensor.get("lat", 0), latest_sensor.get("lon", 0))
+                near_h, h_dist = get_nearest_house(lat, lon)
                 house_tag = f"{near_h['id']} - {near_h['name']} (@ {h_dist:.1f}m)" if (near_h and h_dist <= 25.0) else "Road Corridor (Auto-allocated)"
 
+                raw_lat_val = latest_sensor.get("raw_gps_lat") or lat
+                raw_lon_val = latest_sensor.get("raw_gps_lon") or lon
+
                 print("\n" + "=" * 65)
-                print(f"[FIELD LOG] 📸 EVIDENCE UPLOADED & ALLOCATED")
+                print(f"[FIELD LOG] 📸 EVIDENCE UPLOADED & STORED IN BACKEND")
                 print(f"            EvidenceImageId: #{img_id}")
                 print(f"            Server Path:     {res_json.get('relativePath', 'N/A')}")
-                print(f"            Linked House:    {house_tag}")
+                if is_in_safe_zone(raw_lat_val, raw_lon_val):
+                    print(f"            GPS Coordinates: ({lat:.6f}, {lon:.6f}) [🛡 SAFE ZONE - NO SNAP]")
+                elif abs(raw_lat_val - lat) > 0.000001 or abs(raw_lon_val - lon) > 0.000001:
+                    drift_val = haversine_dist_meters(raw_lat_val, raw_lon_val, lat, lon)
+                    print(f"            Real Raw GPS:    ({raw_lat_val:.6f}, {raw_lon_val:.6f})")
+                    print(f"            Road Snapped GPS:({lat:.6f}, {lon:.6f}) [Correction: {drift_val:.1f}m]")
+                else:
+                    print(f"            GPS Coordinates: ({lat:.6f}, {lon:.6f})")
+                print(f"            Associated House:{house_tag}")
                 print(f"            Access URL:      {img_url}")
-                print(f"            Session ID:      #{latest_sensor.get('active_session_id', 0)}")
+                print(f"            Session ID:      #{active_sid}")
                 print("=" * 65 + "\n")
-            else:
+            elif resp is not None:
                 print(f"[EVIDENCE UPLOAD FAILED] HTTP {resp.status_code}: {resp.text}")
 
         except Exception as e:
@@ -904,18 +1249,50 @@ def gps_fallback_worker(stop_event):
                     last_fix_now = latest_sensor.get("last_gnss_fix_time")
                     still_stale = (last_fix_now is None) or (time.monotonic() - last_fix_now > GNSS_FALLBACK_TIMEOUT_SEC)
                     if lat is not None and lon is not None and still_stale:
+                        raw_lat, raw_lon = lat, lon
+                        latest_sensor["raw_gps_lat"] = raw_lat
+                        latest_sensor["raw_gps_lon"] = raw_lon
+
+                        snapped_lat, snapped_lon, in_sz, is_snapped, road_bearing = snap_coordinates_to_road(raw_lat, raw_lon)
+                        lat, lon = snapped_lat, snapped_lon
+                        dist_drift = haversine_dist_meters(raw_lat, raw_lon, snapped_lat, snapped_lon)
+
+                        latest_sensor["is_inside_safe_zone"] = in_sz
+                        latest_sensor["is_snapped"] = is_snapped
+                        latest_sensor["road_bearing"] = road_bearing
+
                         latest_sensor["lat"] = lat
                         latest_sensor["lon"] = lon
+                        latest_sensor["heading"] = compute_heading_from_gps_history(lat, lon)
+                        latest_sensor["last_known_valid_lat"] = lat
+                        latest_sensor["last_known_valid_lon"] = lon
+                        latest_sensor["last_known_valid_heading"] = latest_sensor["heading"]
+                        latest_sensor["last_known_valid_timestamp"] = time.time()
                         latest_sensor["gps_valid"] = True
                         latest_sensor["location_source"] = "fallback"
+                        track_field_events(lat, lon, latest_sensor.get("speed", 0.0), latest_sensor["heading"])
+
                         if not hardware_state["gps"]["logged_fallback"]:
                             hardware_state["gps"]["logged_fallback"] = True
-                            log_hardware(
-                                "GPS FALLBACK", "LAPTOP GPS ACTIVE",
-                                f"GNSS unavailable — using laptop location ({city or ip or 'Laptop Geolocation'}): {lat:.6f}, {lon:.6f}"
-                            )
+                            if is_in_safe_zone(raw_lat, raw_lon):
+                                log_hardware(
+                                    "GPS FALLBACK", "SAFE ZONE ACTIVE (NO SNAP)",
+                                    f"True GPS ({city or ip or 'Laptop'}): ({raw_lat:.6f}, {raw_lon:.6f}) [🛡 Municipal Depot Safe Zone]"
+                                )
+                            else:
+                                log_hardware(
+                                    "GPS FALLBACK", "ROAD SNAP APPLIED",
+                                    f"Raw GPS: ({raw_lat:.6f}, {raw_lon:.6f}) -> Snapped Road: ({snapped_lat:.6f}, {snapped_lon:.6f}) [Drift: {dist_drift:.1f}m]"
+                                )
+                    elif still_stale and latest_sensor.get("last_known_valid_lat") is not None:
+                        # Signal lost — maintain last known vehicle location
+                        latest_sensor["lat"] = latest_sensor["last_known_valid_lat"]
+                        latest_sensor["lon"] = latest_sensor["last_known_valid_lon"]
+                        latest_sensor["heading"] = latest_sensor["last_known_valid_heading"]
+                        latest_sensor["gps_valid"] = True
+                        latest_sensor["location_source"] = "last_known"
             else:
-                if latest_sensor.get("location_source") == "fallback":
+                if latest_sensor.get("location_source") in ("fallback", "last_known"):
                     latest_sensor["location_source"] = "gnss"
                     hardware_state["gps"]["logged_fallback"] = False
                     log_hardware("GPS FALLBACK", "GNSS RECOVERED", "Hardware GNSS fix restored — laptop fallback disengaged.")
@@ -1154,14 +1531,116 @@ def main():
     GNSS_FALLBACK_TIMEOUT_SEC = args.gps_fallback_timeout
 
     os.makedirs(args.save_dir, exist_ok=True)
+    # Strict Hardware Discovery Check
+    target_port, port_objs = find_arduino_port(args.port)
+    is_explicit_dev_override = bool(args.device_id and args.device_id not in ("AUTO", "UNASSIGNED", ""))
+
+    if target_port is None and not is_explicit_dev_override:
+        port_list = "\n".join([f"   • {p.device}: {p.description}" for p in port_objs]) if port_objs else "   • (No USB-to-Serial devices detected)"
+        print("\n" + "=" * 76)
+        print(" [FATAL ERROR] HARDWARE MICROCONTROLLER NOT DETECTED!")
+        print(" " + "-" * 74)
+        print(" SWSTP Edge Gateway requires a physical hardware unit (Arduino/ESP32).")
+        print(" Each device holds a unique hardware identification ID stored in its EEPROM.")
+        print(" The edge program will not start without connected hardware.")
+        print("")
+        print(" Scanned Serial Ports:")
+        print(port_list)
+        print("")
+        print(" Action Required:")
+        print("   1. Connect the SWSTP Hardware Unit to your PC via USB cable.")
+        print("   2. Verify the USB-Serial driver is active in Device Manager.")
+        print("   3. Re-run: python webcam_motion_detect.py")
+        print("=" * 76 + "\n")
+        sys.exit(1)
+
+    effective_backend_url = auto_detect_backend_url(args.backend_url)
+    sync_backend_metadata(effective_backend_url, args.ulb_id)
+
+    effective_device_id = None
+    effective_session_id = 0
+    active_ser = None
+
+    if is_explicit_dev_override:
+        effective_device_id = args.device_id
+        effective_session_id = ensure_hardware_session(effective_backend_url, effective_device_id)
+        dynamic_session_info["deviceId"] = effective_device_id
+        dynamic_session_info["sessionId"] = effective_session_id
+        latest_sensor["deviceId"] = effective_device_id
+        latest_sensor["active_session_id"] = effective_session_id
+    else:
+        # Mandatory Early Hardware EEPROM Handshake
+        print(f"\n[HANDSHAKE] Connecting to hardware on {target_port} @ {args.baud} baud...")
+        handshake_deadline = time.monotonic() + 6.0
+        handshake_success = False
+
+        try:
+            active_ser = serial.Serial(port=target_port, baudrate=args.baud, timeout=1.0)
+            time.sleep(0.8) # Allow serial line settle
+            active_ser.reset_input_buffer()
+            # Send newline to trigger instant transmission if MCU was idle
+            try:
+                active_ser.write(b"\n")
+            except Exception:
+                pass
+
+            while time.monotonic() < handshake_deadline:
+                raw = active_ser.readline()
+                if raw:
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if "{" in line and "}" in line:
+                        try:
+                            d = json.loads(line[line.find("{"):line.rfind("}") + 1])
+                            hw_id = d.get("device_id") or d.get("deviceId") or d.get("deviceCode")
+                            if hw_id and str(hw_id).strip() and str(hw_id).strip() not in ("UNASSIGNED", "AUTO", ""):
+                                effective_device_id = str(hw_id).strip()
+                                dynamic_session_info["deviceId"] = effective_device_id
+                                latest_sensor["deviceId"] = effective_device_id
+                                effective_session_id = ensure_hardware_session(effective_backend_url, effective_device_id)
+                                dynamic_session_info["sessionId"] = effective_session_id
+                                latest_sensor["active_session_id"] = effective_session_id
+                                parse_serial_line(line)
+                                handshake_success = True
+                                log_hardware("HARDWARE EEPROM HANDSHAKE", "VERIFIED & BOUND", f"Device ID: {effective_device_id} | Active Session #{effective_session_id}")
+                                break
+                        except Exception:
+                            pass
+        except Exception as ex:
+            print(f"[HANDSHAKE ERROR] Could not open {target_port}: {ex}")
+
+        if not handshake_success or not effective_device_id:
+            if active_ser and active_ser.is_open:
+                try:
+                    active_ser.close()
+                except Exception:
+                    pass
+            print("\n" + "=" * 76)
+            print(" [FATAL ERROR] HARDWARE HANDSHAKE FAILED!")
+            print(" " + "-" * 74)
+            print(f" Port {target_port} was detected, but the microcontroller did not return")
+            print(" a valid EEPROM Device ID within 6 seconds.")
+            print("")
+            print(" Action Required:")
+            print("   1. Verify the SWSTP Telemetry firmware is flashed to the Arduino/ESP32.")
+            print("   2. Close any Arduino IDE Serial Monitor window occupying the COM port.")
+            print("   3. Disconnect and re-plug the USB cable, then re-run:")
+            print("      python webcam_motion_detect.py")
+            print("=" * 76 + "\n")
+            sys.exit(1)
+
+    effective_ulb_id = args.ulb_id if (args.ulb_id and args.ulb_id != "AUTO") else (dynamic_session_info.get("ulbId") or "ULB_MH_AMRAVATI")
+    if not effective_session_id and args.session_id > 0:
+        effective_session_id = args.session_id
+
     print(f"\n========================================================")
     print(f" SWSTP EDGE GATEWAY INITIALIZING")
-    print(f" Backend Endpoint: {args.backend_url}")
-    print(f" Device ID:        {args.device_id}")
-    print(f" ULB ID:           {args.ulb_id}")
-    print(f" Session ID:       {args.session_id if args.session_id else 'AUTO-DETECT ACTIVE SESSION'}")
-    print(f" Serial Port:      {args.port} @ {args.baud} baud")
+    print(f" Backend Endpoint: {effective_backend_url}")
+    print(f" Device ID:        {effective_device_id}")
+    print(f" ULB ID:           {effective_ulb_id}")
+    print(f" Session ID:       {effective_session_id if effective_session_id else 'DYNAMIC HARDWARE BIND'}")
+    print(f" Serial Port:      {target_port or args.port} @ {args.baud} baud")
     print(f" Motion Captures:  {os.path.abspath(args.save_dir)}")
+    print(f" Dynamic Houses:   {len(dynamic_houses)} registered buildings")
     print(f"========================================================\n")
 
     source = int(args.source) if (args.source and args.source.isdigit()) else (args.source or VIDEO_SOURCE)
@@ -1202,20 +1681,20 @@ def main():
 
     stop_event = threading.Event()
 
-    # 1. Start Serial Reader Thread
-    t_serial = threading.Thread(target=serial_reader, args=(args.port, args.baud, stop_event), daemon=True)
+    # 1. Start Serial Reader Thread (passes active_ser so port is not closed and reopened)
+    t_serial = threading.Thread(target=serial_reader, args=(args.port, args.baud, stop_event, active_ser), daemon=True)
     t_serial.start()
 
     # 2. Start Live Frame Streamer Thread (feeds /api/camera/{deviceId}/frame)
-    t_streamer = threading.Thread(target=live_frame_streamer, args=(args.backend_url, args.device_id, args.fps_stream, stop_event), daemon=True)
+    t_streamer = threading.Thread(target=live_frame_streamer, args=(effective_backend_url, effective_device_id, args.fps_stream, stop_event), daemon=True)
     t_streamer.start()
 
     # 3. Start Telemetry Ingestion Thread (feeds /api/telemetry/ingest-batch)
-    t_telemetry = threading.Thread(target=telemetry_streamer, args=(args.backend_url, args.session_id, args.ulb_id, stop_event), daemon=True)
+    t_telemetry = threading.Thread(target=telemetry_streamer, args=(effective_backend_url, effective_session_id, effective_ulb_id, stop_event), daemon=True)
     t_telemetry.start()
 
     # 4. Start Evidence Upload Worker Thread (feeds /api/evidence/upload)
-    t_evidence = threading.Thread(target=evidence_upload_worker, args=(args.backend_url, stop_event), daemon=True)
+    t_evidence = threading.Thread(target=evidence_upload_worker, args=(effective_backend_url, effective_device_id, effective_ulb_id, stop_event), daemon=True)
     t_evidence.start()
 
     # 5. Start GNSS -> Laptop Location Fallback Worker Thread
@@ -1236,6 +1715,7 @@ def main():
 
     bg_model = None
     frame_count = 0
+    SAVE_COOLDOWN_SEC = 2.0  # Minimum 2.0 seconds between consecutive image captures
     last_save_time = 0.0
     saved_count = 0
     last_known_frame = None
